@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="$1"
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/..
+sed -i "s/version = \".*\";/version = \"$VERSION\";/" nix/package.nix
+sed -i "s/\.version = \".*\",/\.version = \"$VERSION\",/" build.zig.zon
