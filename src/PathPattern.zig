@@ -162,10 +162,27 @@ pub const Matcher = union(enum) {
         };
     }
 
-    fn initMiddle(allocator: Allocator) !Matcher {
+    fn initMiddle(allocator: Allocator, pattern: *const PathPattern) !Matcher {
         var idxs = std.ArrayList(u32).empty;
         try idxs.append(allocator, 0);
+
+        if (pattern.middle) |middle| {
+            var i: usize = 0;
+            while (i < idxs.items.len) : (i += 1) {
+                const idx = idxs.items[i];
+                if (idx < middle.items.len and middle.items[idx] == .wildcard) {
+                    try appendUnique(&idxs, allocator, idx + 1);
+                }
+            }
+        }
         return .{ .middle = idxs };
+    }
+
+    fn appendUnique(list: *std.ArrayList(u32), allocator: Allocator, item: u32) !void {
+        for (list.items) |i| {
+            if (i == item) return;
+        }
+        try list.append(allocator, item);
     }
 
     pub const PartMatchResult = enum {
@@ -178,36 +195,39 @@ pub const Matcher = union(enum) {
         if (self.* == .prefix) prefix: {
             const idx = self.prefix;
             const prefix = pattern.prefix orelse {
-                self.* = try Matcher.initMiddle(allocator);
+                self.* = try Matcher.initMiddle(allocator, pattern);
                 break :prefix;
             };
-            const matches = try partMatches(partAt(prefix, idx) orelse return .differs, part);
+            const expected_part = partAt(prefix, idx) orelse return .differs;
+            const matches = try partMatches(expected_part, part);
             if (!matches) return .differs;
             if (partAt(prefix, idx + 1) == null) {
-                self.* = try Matcher.initMiddle(allocator);
+                self.* = try Matcher.initMiddle(allocator, pattern);
             } else {
                 self.prefix += 1;
             }
-            return if (pattern.middle == null and pattern.file == null)
-                .matches
-            else
-                .proceed;
+
+            if (self.* == .middle) {
+                if (pattern.middle == null and pattern.file == null) return .matches;
+                return .proceed;
+            }
+            return .proceed;
         }
 
         if (self.* == .middle) middle: {
             const idxs = &self.middle;
-            const middle = pattern.middle orelse {
+            if (pattern.middle == null) {
                 idxs.deinit(allocator);
                 self.* = .file;
                 break :middle;
-            };
-            const res = try nextMiddlePart(allocator, idxs, middle.items, part);
+            }
+            const res = try nextMiddlePart(allocator, idxs, pattern, part);
             switch (res) {
                 .differs, .proceed => return res,
                 .matches => {
                     idxs.deinit(allocator);
                     self.* = .file;
-                    return if (pattern.file == null) .matches else .proceed;
+                    return .matches;
                 },
             }
         }
@@ -220,33 +240,82 @@ pub const Matcher = union(enum) {
         unreachable;
     }
 
-    fn nextMiddlePart(allocator: Allocator, middle_idxs: *std.ArrayList(u32), pattern: []const MiddlePart, part: []const u8) !PartMatchResult {
-        var idxs_start: usize = 0;
-        var idxs_end = middle_idxs.items.len;
-        while (idxs_start < idxs_end) {
-            const p_idx = middle_idxs.items[idxs_start];
-            switch (pattern[p_idx]) {
+    fn nextMiddlePart(allocator: Allocator, middle_idxs: *std.ArrayList(u32), pattern: *const PathPattern, part: []const u8) !PartMatchResult {
+        var new_idxs = std.ArrayList(u32).empty;
+        const middle = pattern.middle.?.items;
+        var matched_file = false;
+
+        for (middle_idxs.items) |p_idx| {
+            if (p_idx == middle.len) {
+                if (pattern.file) |file| {
+                    if (try partMatches(file, part)) {
+                        matched_file = true;
+                    }
+                }
+                continue;
+            }
+
+            switch (middle[p_idx]) {
                 .dir => |dir_pattern| {
                     if (try partMatches(dir_pattern, part)) {
-                        middle_idxs.items[idxs_start] += 1;
-                        if (middle_idxs.items[idxs_start] == middle_idxs.items.len) return .matches;
-                        idxs_start += 1;
-                    } else {
-                        _ = middle_idxs.orderedRemove(idxs_start);
-                        idxs_end -= 1;
+                        try appendUnique(&new_idxs, allocator, p_idx + 1);
                     }
                 },
                 .wildcard => {
-                    if (p_idx + 1 == pattern.len) return .matches;
-                    if (try partMatches(pattern[p_idx + 1].dir, part)) {
-                        try middle_idxs.append(allocator, p_idx + 1);
+                    try appendUnique(&new_idxs, allocator, p_idx);
+
+                    if (p_idx + 1 < middle.len) {
+                        const next_part_pat = middle[p_idx + 1];
+                        switch (next_part_pat) {
+                            .dir => |d| {
+                                if (try partMatches(d, part)) {
+                                    try appendUnique(&new_idxs, allocator, p_idx + 2);
+                                }
+                            },
+                            .wildcard => {
+                                try appendUnique(&new_idxs, allocator, p_idx + 1);
+                            },
+                        }
+                    } else {
+                        if (pattern.file) |file| {
+                            if (try partMatches(file, part)) {
+                                matched_file = true;
+                            }
+                        } else {
+                            matched_file = true;
+                        }
                     }
-                    idxs_start += 1;
                 },
             }
         }
-        if (middle_idxs.items.len == 0) return .differs;
-        return .proceed;
+
+        var i: usize = 0;
+        while (i < new_idxs.items.len) : (i += 1) {
+            const idx = new_idxs.items[i];
+            if (idx < middle.len and middle[idx] == .wildcard) {
+                try appendUnique(&new_idxs, allocator, idx + 1);
+            }
+        }
+
+        middle_idxs.deinit(allocator);
+        middle_idxs.* = new_idxs;
+
+        if (matched_file) return .matches;
+
+        var completed_middle_path = false;
+        for (middle_idxs.items) |idx| {
+            if (idx == middle.len) {
+                completed_middle_path = true;
+                break;
+            }
+        }
+        
+        if (completed_middle_path and pattern.file == null) {
+            return .matches;
+        }
+
+        if (middle_idxs.items.len > 0) return .proceed;
+        return .differs;
     }
 
     fn partMatches(pattern: []const u8, part: []const u8) Allocator.Error!bool {
@@ -349,114 +418,73 @@ fn testParse(expected: anytype, pattern: []const u8) !void {
     try expectEqualDeep(expected.file, actual.file);
 }
 
-test "parse - simple file" {
-    const expected = .{
+test "parse" {
+    try testParse(.{
         .is_root = false,
         .prefix = null,
         .middle = null,
         .file = "hello",
-    };
-    try testParse(expected, "hello");
-}
-
-test "parse - root file" {
-    const expected = .{
+    }, "hello");
+    try testParse(.{
         .is_root = true,
         .prefix = null,
         .middle = null,
         .file = "hello",
-    };
-    try testParse(expected, "/hello");
-}
-
-test "parse - with prefix" {
-    const expected = .{
+    }, "/hello");
+    try testParse(.{
         .is_root = false,
         .prefix = "src",
         .middle = null,
         .file = "main.zig",
-    };
-    try testParse(expected, "src/main.zig");
-}
-
-test "parse root with prefix" {
-    const expected = .{
+    }, "src/main.zig");
+    try testParse(.{
         .is_root = true,
         .prefix = "usr",
         .middle = null,
         .file = "bin",
-    };
-    try testParse(expected, "/usr/bin");
-}
-
-test "parse only prefix (directory)" {
-    const expected = .{
+    }, "/usr/bin");
+    try testParse(.{
         .is_root = false,
         .prefix = "src",
         .middle = null,
         .file = null,
-    };
-    try testParse(expected, "src/");
-}
-
-test "parse - wildcard file" {
-    const expected = .{
+    }, "src/");
+    try testParse(.{
         .is_root = false,
         .prefix = null,
         .middle = null,
         .file = "*.zig",
-    };
-    try testParse(expected, "*.zig");
-}
-
-test "parse - prefix and wildcard file" {
-    const expected = .{
+    }, "*.zig");
+    try testParse(.{
         .is_root = false,
         .prefix = "src",
         .middle = null,
         .file = "*.zig",
-    };
-    try testParse(expected, "src/*.zig");
-}
-
-test "parse - middle wildcard" {
-    const expected = .{
+    }, "src/*.zig");
+    try testParse(.{
         .is_root = false,
         .prefix = "src",
         .middle = &[_]MiddlePart{.wildcard},
         .file = "main.zig",
-    };
-    try testParse(expected, "src/**/main.zig");
-}
-
-test "parse - complex middle" {
-    const expected = .{
+    }, "src/**/main.zig");
+    try testParse(.{
         .is_root = false,
         .prefix = "src",
         .middle = &[_]MiddlePart{ .wildcard, .{ .dir = "test" } },
         .file = "*.zig",
-    };
-    try testParse(expected, "src/**/test/*.zig");
-}
-
-test "parse - escaped wildcard" {
-    const expected = .{
+    }, "src/**/test/*.zig");
+    try testParse(.{
         .is_root = false,
         .prefix = "src",
         .middle = null,
         .file = "\\*.zig",
-    };
-    try testParse(expected, "src/\\*.zig");
-}
-
-test "parse - root only" {
-    const expected = .{
+    }, "src/\\*.zig");
+    try testParse(.{
         .is_root = true,
         .prefix = null,
         .middle = null,
         .file = null,
-    };
-    try testParse(expected, "/");
+    }, "/");
 }
 
 test "partAt" {
@@ -496,65 +524,82 @@ test "Matcher.partMatches - partial wildcard mismatch" {
 test "Matcher.nextMiddlePart" {
     const allocator = std.testing.allocator;
 
-    // Case 1: Simple directory match
     {
-        var middle_parts = std.ArrayList(MiddlePart).empty;
-        defer middle_parts.deinit(allocator);
-        try middle_parts.append(allocator, .{ .dir = "a" });
-
+        var middle_list = std.ArrayList(MiddlePart).empty;
+        defer middle_list.deinit(allocator);
+        try middle_list.append(allocator, .{ .dir = "a" });
+        const dummy_pattern = PathPattern{
+            .is_root = false,
+            .prefix = null,
+            .middle = middle_list,
+            .file = null,
+        };
         var idxs = std.ArrayList(u32).empty;
         defer idxs.deinit(allocator);
         try idxs.append(allocator, 0);
 
-        const res = try Matcher.nextMiddlePart(allocator, &idxs, middle_parts.items, "a");
+        const res = try Matcher.nextMiddlePart(allocator, &idxs, &dummy_pattern, "a");
         try expectEqual(.matches, res);
         try expectEqual(1, idxs.items.len);
         try expectEqual(1, idxs.items[0]);
     }
 
-    // Case 2: Simple directory mismatch
     {
-        var middle_parts = std.ArrayList(MiddlePart).empty;
-        defer middle_parts.deinit(allocator);
-        try middle_parts.append(allocator, .{ .dir = "a" });
-
+        var middle_list = std.ArrayList(MiddlePart).empty;
+        defer middle_list.deinit(allocator);
+        try middle_list.append(allocator, .{ .dir = "a" });
+        const dummy_pattern = PathPattern{
+            .is_root = false,
+            .prefix = null,
+            .middle = middle_list,
+            .file = null,
+        };
         var idxs = std.ArrayList(u32).empty;
         defer idxs.deinit(allocator);
         try idxs.append(allocator, 0);
 
-        const res = try Matcher.nextMiddlePart(allocator, &idxs, middle_parts.items, "b");
+        const res = try Matcher.nextMiddlePart(allocator, &idxs, &dummy_pattern, "b");
         try expectEqual(.differs, res);
         try expectEqual(0, idxs.items.len);
     }
 
-    // Case 3: Wildcard at end
     {
-        var middle_parts = std.ArrayList(MiddlePart).empty;
-        defer middle_parts.deinit(allocator);
-        try middle_parts.append(allocator, .wildcard);
-
+        var middle_list = std.ArrayList(MiddlePart).empty;
+        defer middle_list.deinit(allocator);
+        try middle_list.append(allocator, .wildcard);
+        const dummy_pattern = PathPattern{
+            .is_root = false,
+            .prefix = null,
+            .middle = middle_list,
+            .file = null,
+        };
         var idxs = std.ArrayList(u32).empty;
         defer idxs.deinit(allocator);
         try idxs.append(allocator, 0);
 
-        const res = try Matcher.nextMiddlePart(allocator, &idxs, middle_parts.items, "anything");
+        const res = try Matcher.nextMiddlePart(allocator, &idxs, &dummy_pattern, "anything");
         try expectEqual(.matches, res);
-        try expectEqual(1, idxs.items.len);
+        try expectEqual(2, idxs.items.len);
         try expectEqual(0, idxs.items[0]);
+        try expectEqual(1, idxs.items[1]);
     }
 
-    // Case 4: Wildcard followed by dir
     {
-        var middle_parts = std.ArrayList(MiddlePart).empty;
-        defer middle_parts.deinit(allocator);
-        try middle_parts.append(allocator, .wildcard);
-        try middle_parts.append(allocator, .{ .dir = "b" });
-
+        var middle_list = std.ArrayList(MiddlePart).empty;
+        defer middle_list.deinit(allocator);
+        try middle_list.append(allocator, .wildcard);
+        try middle_list.append(allocator, .{ .dir = "b" });
+        const dummy_pattern = PathPattern{
+            .is_root = false,
+            .prefix = null,
+            .middle = middle_list,
+            .file = null,
+        };
         var idxs = std.ArrayList(u32).empty;
         defer idxs.deinit(allocator);
         try idxs.append(allocator, 0);
 
-        const res = try Matcher.nextMiddlePart(allocator, &idxs, middle_parts.items, "a");
+        const res = try Matcher.nextMiddlePart(allocator, &idxs, &dummy_pattern, "a");
         try expectEqual(.proceed, res);
     }
 }
@@ -562,54 +607,53 @@ test "Matcher.nextMiddlePart" {
 test "Matcher.nextPart" {
     const allocator = std.testing.allocator;
 
-    // 1. Prefix match -> transition to file
     {
         var pattern = try init(allocator, "src/main.zig");
         defer pattern.deinit(allocator);
         var matcher = Matcher.init();
         defer matcher.deinit(allocator);
 
-        // "src" matches prefix
-        try expectEqual(Matcher.PartMatchResult.proceed, try matcher.nextPart(allocator, &pattern, "src"));
-        // "main.zig" matches file
-        try expectEqual(Matcher.PartMatchResult.matches, try matcher.nextPart(allocator, &pattern, "main.zig"));
+        try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "src"));
+        try expectEqual(.matches, try matcher.nextPart(allocator, &pattern, "main.zig"));
     }
 
-    // 2. Multi-part prefix
     {
         var pattern = try init(allocator, "a/b/c");
         defer pattern.deinit(allocator);
         var matcher = Matcher.init();
         defer matcher.deinit(allocator);
 
-        // "a"
-        try expectEqual(Matcher.PartMatchResult.proceed, try matcher.nextPart(allocator, &pattern, "a"));
-        // "b"
-        try expectEqual(Matcher.PartMatchResult.proceed, try matcher.nextPart(allocator, &pattern, "b"));
-        // "c"
-        try expectEqual(Matcher.PartMatchResult.matches, try matcher.nextPart(allocator, &pattern, "c"));
+        try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "a"));
+        try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "b"));
+        try expectEqual(.matches, try matcher.nextPart(allocator, &pattern, "c"));
     }
 
-    // 3. Middle Wildcard
     {
-        // var pattern = try init(allocator, "src/**/test.zig");
-        // defer pattern.deinit(allocator);
-        // var matcher = Matcher.init();
-        // defer matcher.deinit(allocator);
-
-        // "src" -> enters middle
-        // try expectEqual(Matcher.PartMatchResult.proceed, try matcher.nextPart(allocator, &pattern, "src"));
-        // "a" -> matches wildcard
-        // try expectEqual(Matcher.PartMatchResult.proceed, try matcher.nextPart(allocator, &pattern, "a"));
+        var pattern = try init(allocator, "src/**/test.zig");
+        defer pattern.deinit(allocator);
+        {
+            var matcher = Matcher.init();
+            defer matcher.deinit(allocator);
+            try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "src"));
+            try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "a"));
+            try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "b"));
+            try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "c"));
+            try expectEqual(.matches, try matcher.nextPart(allocator, &pattern, "test.zig"));
+        }
+        {
+            var matcher = Matcher.init();
+            defer matcher.deinit(allocator);
+            try expectEqual(.proceed, try matcher.nextPart(allocator, &pattern, "src"));
+            try expectEqual(.matches, try matcher.nextPart(allocator, &pattern, "test.zig"));
+        }
     }
 
-    // 4. Mismatch
     {
         var pattern = try init(allocator, "src/main.zig");
         defer pattern.deinit(allocator);
         var matcher = Matcher.init();
         defer matcher.deinit(allocator);
 
-        try expectEqual(Matcher.PartMatchResult.differs, try matcher.nextPart(allocator, &pattern, "lib"));
+        try expectEqual(.differs, try matcher.nextPart(allocator, &pattern, "lib"));
     }
 }
