@@ -1,4 +1,7 @@
 # Slim Down
+
+[![CI](https://github.com/joo-was-already-taken/slim-down/actions/workflows/ci.yaml/badge.svg)](https://github.com/joo-was-already-taken/slim-down/actions/workflows/ci.yaml)
+
 A lightweight CLI tool to clean up disk by removing files and directories matching specified patterns, with support for ignore rules.
 
 ## Features
